@@ -1,0 +1,5 @@
+.venv/
+.env
+oi_snapshots.duckdb
+__pycache__/
+*.pyc
