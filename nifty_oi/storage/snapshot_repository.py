@@ -115,3 +115,62 @@ class SnapshotRepository:
         con.close()
         return None if d is None else str(d)
 
+    def list_opt_expiries(self) -> list[str]:
+        con = duckdb.connect(self.db_path)
+        q = """
+            SELECT DISTINCT CAST(opt_expiry AS VARCHAR) AS expiry
+            FROM oi_snapshots
+            ORDER BY expiry DESC
+        """
+        rows = con.execute(q).fetchall()
+        con.close()
+        return [r[0] for r in rows if r[0] is not None]
+
+    def list_trade_dates(self, opt_expiry_iso: str | None = None) -> list[str]:
+        con = duckdb.connect(self.db_path)
+        if opt_expiry_iso:
+            q = """
+                SELECT DISTINCT CAST(trade_date AS VARCHAR) AS d
+                FROM oi_snapshots
+                WHERE opt_expiry = ?
+                ORDER BY d DESC
+            """
+            rows = con.execute(q, [opt_expiry_iso]).fetchall()
+        else:
+            q = """
+                SELECT DISTINCT CAST(trade_date AS VARCHAR) AS d
+                FROM oi_snapshots
+                ORDER BY d DESC
+            """
+            rows = con.execute(q).fetchall()
+        con.close()
+        return [r[0] for r in rows if r[0] is not None]
+
+    def load_filtered(
+        self,
+        trade_date_iso: str,
+        opt_expiry_iso: str,
+        rights: list[str] | None = None,
+        strikes: list[int] | None = None,
+        limit: int = 5000,
+    ) -> pd.DataFrame:
+        con = duckdb.connect(self.db_path)
+        rights = rights or []
+        strikes = strikes or []
+        q = """
+            SELECT ts, trade_date, opt_expiry, strike, opt_right, tradingsymbol, oi, ltp, volume, fut_ltp
+            FROM oi_snapshots
+            WHERE trade_date = ? AND opt_expiry = ?
+        """
+        params: list = [trade_date_iso, opt_expiry_iso]
+        if rights:
+            q += " AND opt_right IN ({})".format(",".join(["?"] * len(rights)))
+            params.extend(rights)
+        if strikes:
+            q += " AND strike IN ({})".format(",".join(["?"] * len(strikes)))
+            params.extend(strikes)
+        q += " ORDER BY ts DESC LIMIT ?"
+        params.append(int(limit))
+        df = con.execute(q, params).fetchdf()
+        con.close()
+        return df

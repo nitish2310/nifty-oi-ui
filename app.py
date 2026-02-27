@@ -66,6 +66,9 @@ load_yday_close = snapshot_repo.load_yday_close
 load_latest_snapshot = snapshot_repo.load_latest_snapshot
 delete_outside_session = snapshot_repo.delete_outside_session
 latest_available_trade_date = snapshot_repo.latest_available_trade_date
+list_opt_expiries = snapshot_repo.list_opt_expiries
+list_trade_dates = snapshot_repo.list_trade_dates
+load_filtered = snapshot_repo.load_filtered
 
 
 def should_insert_snapshot(now_ts: datetime) -> bool:
@@ -88,7 +91,7 @@ init_db()
 try:
     now_ts = now_ist()
     trade_date = now_ts.date().isoformat()
-    market_live = True #is_market_open(now_ts)
+    market_live = is_market_open(now_ts)
 
     inst_df = load_instruments()
     opt_expiry = pick_nearest_weekly_nifty_opt_expiry(inst_df)
@@ -480,7 +483,7 @@ try:
     st.subheader("Live OI Board (Stable ATM ±100)")
     st.dataframe(board, use_container_width=True, hide_index=True)
 
-    tab1, tab2, tab3 = st.tabs(["Charts", "Raw (latest)", "Debug"])
+    tab1, tab2, tab3, tab4 = st.tabs(["Charts", "Raw (latest)", "Debug", "Data Explorer"])
 
     with tab1:
         st.caption("Charts are from stored snapshots today.")
@@ -532,6 +535,100 @@ try:
         #     delete_outside_session(trade_date, opt_expiry)
         #     st.success("Deleted rows outside 09:15–15:30 for today.")
         #     st.rerun()
+
+    with tab4:
+        st.caption("Explore historical snapshots stored in DuckDB.")
+        expiry_options = list_opt_expiries()
+        if not expiry_options:
+            st.info("No data found in DB yet.")
+        else:
+            default_expiry_idx = expiry_options.index(opt_expiry) if opt_expiry in expiry_options else 0
+            exp_sel = st.selectbox("Option expiry", expiry_options, index=default_expiry_idx, key="explorer_expiry")
+
+            date_options = list_trade_dates(exp_sel)
+            if not date_options:
+                st.info("No trade dates found for selected expiry.")
+            else:
+                default_date_idx = date_options.index(trade_date) if trade_date in date_options else 0
+                date_sel = st.selectbox("Trade date", date_options, index=default_date_idx, key="explorer_date")
+
+                day_df = load_day(date_sel, exp_sel)
+                strike_options = sorted(pd.to_numeric(day_df["strike"], errors="coerce").dropna().astype(int).unique().tolist()) if not day_df.empty else []
+
+                c1, c2, c3 = st.columns([2, 2, 1])
+                with c1:
+                    rights_sel = st.multiselect("Option right", ["CE", "PE"], default=["CE", "PE"], key="explorer_rights")
+                with c2:
+                    strike_sel = st.multiselect("Strikes", strike_options, default=strike_options[:5], key="explorer_strikes")
+                with c3:
+                    limit_sel = st.number_input("Rows", min_value=100, max_value=50000, value=5000, step=100, key="explorer_limit")
+                c4, c5 = st.columns([1, 1])
+                with c4:
+                    include_after_hours = st.toggle("Include after-hours", value=False, key="explorer_after_hours")
+                with c5:
+                    interval_sel = st.selectbox("View interval", ["1m", "5m", "15m"], index=0, key="explorer_interval")
+
+                qdf = load_filtered(
+                    trade_date_iso=date_sel,
+                    opt_expiry_iso=exp_sel,
+                    rights=rights_sel,
+                    strikes=strike_sel,
+                    limit=int(limit_sel),
+                )
+
+                if qdf.empty:
+                    st.warning("No rows for selected filters.")
+                else:
+                    qdf = qdf.copy()
+                    qdf["ts"] = pd.to_datetime(qdf["ts"], errors="coerce")
+                    if not include_after_hours:
+                        qdf = qdf[
+                            (qdf["ts"].dt.time >= MARKET_OPEN)
+                            & (qdf["ts"].dt.time <= MARKET_CLOSE)
+                        ].copy()
+
+                    freq_map = {"1m": "1min", "5m": "5min", "15m": "15min"}
+                    if interval_sel in freq_map:
+                        qdf["bucket_ts"] = qdf["ts"].dt.floor(freq_map[interval_sel])
+                        qdf = (
+                            qdf.sort_values("ts")
+                            .groupby(
+                                [
+                                    "bucket_ts",
+                                    "trade_date",
+                                    "opt_expiry",
+                                    "strike",
+                                    "opt_right",
+                                    "tradingsymbol",
+                                ],
+                                as_index=False,
+                            )
+                            .agg(
+                                oi=("oi", "last"),
+                                ltp=("ltp", "last"),
+                                volume=("volume", "sum"),
+                                fut_ltp=("fut_ltp", "last"),
+                            )
+                            .rename(columns={"bucket_ts": "ts"})
+                            .sort_values("ts", ascending=False)
+                        )
+
+                    if qdf.empty:
+                        st.warning("No rows after session/interval filters.")
+                    else:
+                        s1, s2, s3, s4 = st.columns(4)
+                        s1.metric("Rows", f"{len(qdf):,}")
+                        s2.metric("Min TS", str(pd.to_datetime(qdf["ts"]).min()))
+                        s3.metric("Max TS", str(pd.to_datetime(qdf["ts"]).max()))
+                        s4.metric("Distinct Symbols", f"{qdf['tradingsymbol'].nunique():,}")
+
+                        st.dataframe(qdf, use_container_width=True, hide_index=True)
+                        st.download_button(
+                            label="Download CSV",
+                            data=qdf.to_csv(index=False).encode("utf-8"),
+                            file_name=f"oi_snapshots_{date_sel}_{exp_sel}.csv",
+                            mime="text/csv",
+                        )
 
     data_asof = hist["ts_ist"].max() if (not hist.empty) else now_ts
     st.caption(f"Data as of: {data_asof} | Market live: {market_live} | DB: {DB_PATH}")
