@@ -1,14 +1,19 @@
 import os
-from datetime import datetime, date, timedelta, time as dtime
-import math
+import time
+from datetime import datetime, timedelta, time as dtime
+
+import numpy as np
 import pandas as pd
 import streamlit as st
+import math
 from dotenv import load_dotenv
 from kiteconnect import KiteConnect
-import duckdb
-import time
-import numpy as np
-from zoneinfo import ZoneInfo
+
+from nifty_oi.analytics.market_analytics import MarketAnalytics
+from nifty_oi.config import DB_PATH, IST, MARKET_CLOSE, MARKET_OPEN, SPOT_SYMBOL
+from nifty_oi.market_clock import MarketClock
+from nifty_oi.services.kite_data_service import KiteDataService
+from nifty_oi.storage.snapshot_repository import SnapshotRepository
 
 st.set_page_config(page_title="NIFTY OI UI - Step 5", layout="wide")
 load_dotenv()
@@ -25,345 +30,43 @@ if not API_KEY or not ACCESS_TOKEN:
 kite = KiteConnect(api_key=API_KEY)
 kite.set_access_token(ACCESS_TOKEN)
 
-DB_PATH = "oi_snapshots.duckdb"
+analytics = MarketAnalytics()
+data_service = KiteDataService(kite)
+snapshot_repo = SnapshotRepository(DB_PATH, MARKET_OPEN, MARKET_CLOSE)
 
-# -------------------- Utilities --------------------
+
 @st.cache_data(ttl=3600)
 def load_instruments():
-    inst = kite.instruments()
-    return pd.DataFrame(inst)
+    return data_service.load_instruments()
 
-IST = ZoneInfo("Asia/Kolkata")
-MARKET_OPEN = dtime(9, 15)
-MARKET_CLOSE = dtime(15, 30)
 
-def now_ist() -> datetime:
-    return datetime.now(IST)
+now_ist = MarketClock.now_ist
+is_market_open = MarketClock.is_market_open
+round_to_50 = analytics.round_to_50
+time_to_expiry_years = analytics.time_to_expiry_years
+infer_vol_state = analytics.infer_vol_state
+compute_adx = analytics.compute_adx
+classify_quadrant = analytics.classify_quadrant
+mtf_alignment_label = analytics.mtf_alignment_label
+top2_oi_share = analytics.top2_oi_share
+find_wall = analytics.find_wall
+shift_label = analytics.shift_label
+human_compact = analytics.human_compact
+pretty_enum = analytics.pretty_enum
+implied_volatility = analytics.implied_volatility
+compute_deltas = analytics.compute_deltas
+add_impulse_tags = analytics.add_impulse_tags
+pick_nearest_nifty_fut = data_service.pick_nearest_nifty_fut
+pick_nearest_weekly_nifty_opt_expiry = data_service.pick_nearest_weekly_nifty_opt_expiry
+resolve_option_instruments = data_service.resolve_option_instruments
+init_db = snapshot_repo.init_db
+insert_snapshot = snapshot_repo.insert_snapshot
+load_day = snapshot_repo.load_day
+load_yday_close = snapshot_repo.load_yday_close
+load_latest_snapshot = snapshot_repo.load_latest_snapshot
+delete_outside_session = snapshot_repo.delete_outside_session
+latest_available_trade_date = snapshot_repo.latest_available_trade_date
 
-def is_market_open(dt_ist: datetime) -> bool:
-    t = dt_ist.time()
-    return (t >= MARKET_OPEN) and (t <= MARKET_CLOSE)
-
-def round_to_50(x: float) -> int:
-    return int(round(x / 50.0) * 50)
-
-def norm_cdf(x: float) -> float:
-    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
-
-def bs_price(spot: float, strike: float, t_years: float, r: float, vol: float, right: str) -> float:
-    if t_years <= 0.0 or vol <= 0.0 or spot <= 0.0 or strike <= 0.0:
-        intrinsic = max(spot - strike, 0.0) if right == "CE" else max(strike - spot, 0.0)
-        return intrinsic
-
-    sqrt_t = math.sqrt(t_years)
-    d1 = (math.log(spot / strike) + (r + 0.5 * vol * vol) * t_years) / (vol * sqrt_t)
-    d2 = d1 - vol * sqrt_t
-    df = math.exp(-r * t_years)
-    if right == "CE":
-        return spot * norm_cdf(d1) - strike * df * norm_cdf(d2)
-    return strike * df * norm_cdf(-d2) - spot * norm_cdf(-d1)
-
-def implied_volatility(
-    option_price: float,
-    spot: float,
-    strike: float,
-    t_years: float,
-    right: str,
-    r: float = 0.06,
-    min_vol: float = 1e-4,
-    max_vol: float = 5.0,
-    max_iter: int = 60,
-    tol: float = 1e-4,
-) -> float | None:
-    if (
-        not math.isfinite(option_price)
-        or not math.isfinite(spot)
-        or not math.isfinite(strike)
-        or not math.isfinite(t_years)
-        or option_price <= 0.0
-        or spot <= 0.0
-        or strike <= 0.0
-        or t_years <= 0.0
-    ):
-        return None
-
-    intrinsic = max(spot - strike, 0.0) if right == "CE" else max(strike - spot, 0.0)
-    if option_price < intrinsic:
-        return None
-
-    low = min_vol
-    high = max_vol
-    low_p = bs_price(spot, strike, t_years, r, low, right)
-    high_p = bs_price(spot, strike, t_years, r, high, right)
-    if option_price < low_p or option_price > high_p:
-        return None
-
-    for _ in range(max_iter):
-        mid = 0.5 * (low + high)
-        mid_p = bs_price(spot, strike, t_years, r, mid, right)
-        err = mid_p - option_price
-        if abs(err) <= tol:
-            return mid
-        if err > 0:
-            high = mid
-        else:
-            low = mid
-    return 0.5 * (low + high)
-
-def time_to_expiry_years(expiry_iso: str, now_ts_ist: datetime) -> float:
-    expiry_dt = datetime.combine(pd.to_datetime(expiry_iso).date(), MARKET_CLOSE).replace(tzinfo=IST)
-    dt_secs = (expiry_dt - now_ts_ist).total_seconds()
-    return max(dt_secs / (365.0 * 24.0 * 3600.0), 1e-8)
-
-def infer_vol_state(atm_iv: float | None, iv_series: pd.Series) -> str:
-    if atm_iv is None or iv_series.empty:
-        return "—"
-    iv_clean = pd.to_numeric(iv_series, errors="coerce").dropna()
-    if len(iv_clean) < 10:
-        return "NORMAL"
-    p33 = float(iv_clean.quantile(0.33))
-    p66 = float(iv_clean.quantile(0.66))
-    if atm_iv <= p33:
-        return "LOW"
-    if atm_iv >= p66:
-        return "HIGH"
-    return "NORMAL"
-
-def compute_adx(price_df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """
-    Expects columns: high, low, close sorted by time.
-    Returns ADX series aligned to input index.
-    """
-    if price_df.empty:
-        return pd.Series(dtype=float)
-
-    high = pd.to_numeric(price_df["high"], errors="coerce")
-    low = pd.to_numeric(price_df["low"], errors="coerce")
-    close = pd.to_numeric(price_df["close"], errors="coerce")
-
-    up_move = high.diff()
-    down_move = -low.diff()
-    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-
-    tr1 = high - low
-    tr2 = (high - close.shift(1)).abs()
-    tr3 = (low - close.shift(1)).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    atr = tr.ewm(alpha=1.0 / period, adjust=False).mean()
-
-    plus_dm_s = pd.Series(plus_dm, index=price_df.index).ewm(alpha=1.0 / period, adjust=False).mean()
-    minus_dm_s = pd.Series(minus_dm, index=price_df.index).ewm(alpha=1.0 / period, adjust=False).mean()
-
-    plus_di = 100.0 * plus_dm_s / atr.replace(0, np.nan)
-    minus_di = 100.0 * minus_dm_s / atr.replace(0, np.nan)
-    dx = (100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)).fillna(0.0)
-    adx = dx.ewm(alpha=1.0 / period, adjust=False).mean()
-    return adx
-
-def classify_quadrant(d_price: float, d_oi: float, eps_price: float = 0.01, eps_oi: float = 1.0) -> str:
-    if not math.isfinite(d_price) or not math.isfinite(d_oi):
-        return "UNKNOWN"
-    if abs(d_price) <= eps_price or abs(d_oi) <= eps_oi:
-        return "FLAT-MIXED"
-    if d_price > 0 and d_oi > 0:
-        return "LONG_BUILD"
-    if d_price < 0 and d_oi > 0:
-        return "SHORT_BUILD"
-    if d_price > 0 and d_oi < 0:
-        return "SHORT_COVER"
-    return "LONG_UNWIND"
-
-def sign_label(x: float, eps: float = 0.0) -> str:
-    if not math.isfinite(x):
-        return "NA"
-    if x > eps:
-        return "BULLISH"
-    if x < -eps:
-        return "BEARISH"
-    return "NEUTRAL"
-
-def mtf_alignment_label(v1: float, v5: float, v15: float) -> str:
-    s1 = sign_label(v1)
-    s5 = sign_label(v5)
-    s15 = sign_label(v15)
-    if s1 == "BULLISH" and s5 == "BULLISH" and s15 == "BULLISH":
-        return "BULLISH_STRONG"
-    if s1 == "BEARISH" and s5 == "BEARISH" and s15 == "BEARISH":
-        return "BEARISH_STRONG"
-    if s1 == "BULLISH" and s5 == "BULLISH" and s15 != "BEARISH":
-        return "BULLISH_WEAK"
-    if s1 == "BEARISH" and s5 == "BEARISH" and s15 != "BULLISH":
-        return "BEARISH_WEAK"
-    return "MIXED/NO-TRADE"
-
-def top2_oi_share(df: pd.DataFrame, right: str) -> float:
-    x = df[df["opt_right"] == right].copy()
-    if x.empty:
-        return float("nan")
-    by_strike = x.groupby("strike")["oi"].sum().sort_values(ascending=False)
-    total = float(by_strike.sum())
-    if total <= 0:
-        return float("nan")
-    return float(by_strike.head(2).sum() / total)
-
-def find_wall(snapshot: pd.DataFrame, right: str) -> tuple[int | None, float]:
-    x = snapshot[(snapshot["opt_right"] == right)].copy()
-    if x.empty:
-        return None, float("nan")
-    by_strike = x.groupby("strike")["d_oi_5m_num"].sum().sort_values(ascending=False)
-    if by_strike.empty:
-        return None, float("nan")
-    strike = int(by_strike.index[0])
-    return strike, float(by_strike.iloc[0])
-
-def shift_label(curr: int | None, prev: int | None) -> str:
-    if curr is None:
-        return "NA"
-    if prev is None:
-        return "NEW"
-    if curr > prev:
-        return "UP"
-    if curr < prev:
-        return "DOWN"
-    return "UNCHANGED"
-
-def human_compact(n: float) -> str:
-    if not math.isfinite(n):
-        return "—"
-    abs_n = abs(n)
-    if abs_n >= 1_000_000_000:
-        return f"{n / 1_000_000_000:.2f}B"
-    if abs_n >= 1_000_000:
-        return f"{n / 1_000_000:.2f}M"
-    if abs_n >= 1_000:
-        return f"{n / 1_000:.1f}K"
-    return f"{n:.0f}"
-
-def pretty_enum(s: str) -> str:
-    if not s:
-        return "—"
-    return s.replace("_", " ").title()
-
-def pick_nearest_nifty_fut(inst_df: pd.DataFrame) -> tuple[int, str, str]:
-    df = inst_df.copy()
-    df = df[(df["exchange"] == "NFO") & (df["segment"] == "NFO-FUT") & (df["name"] == "NIFTY")]
-    df["expiry"] = pd.to_datetime(df["expiry"])
-    today = pd.Timestamp(date.today())
-    df = df[df["expiry"] >= today].sort_values("expiry", ascending=True)
-    if df.empty:
-        raise RuntimeError("No upcoming NIFTY futures found.")
-    row = df.iloc[0]
-    return int(row["instrument_token"]), str(row["tradingsymbol"]), row["expiry"].date().isoformat()
-
-def pick_nearest_weekly_nifty_opt_expiry(inst_df: pd.DataFrame) -> str:
-    df = inst_df.copy()
-    df = df[(df["exchange"] == "NFO") & (df["segment"] == "NFO-OPT") & (df["name"] == "NIFTY")]
-    df["expiry"] = pd.to_datetime(df["expiry"])
-    today = pd.Timestamp(date.today())
-    df = df[df["expiry"] >= today].sort_values("expiry", ascending=True)
-    if df.empty:
-        raise RuntimeError("No upcoming NIFTY option expiries found.")
-    return df.iloc[0]["expiry"].date().isoformat()
-
-def resolve_option_instruments(inst_df: pd.DataFrame, expiry_iso: str, strikes: list[int]) -> pd.DataFrame:
-    expiry_dt = pd.to_datetime(expiry_iso).date()
-    df = inst_df.copy()
-    df = df[(df["exchange"] == "NFO") & (df["segment"] == "NFO-OPT") & (df["name"] == "NIFTY")]
-    df["expiry"] = pd.to_datetime(df["expiry"]).dt.date
-    df = df[df["expiry"] == expiry_dt]
-    if df.empty:
-        raise RuntimeError(f"No NIFTY options found for expiry {expiry_iso}.")
-    df["strike"] = df["strike"].astype(float).astype(int)
-    df = df[df["strike"].isin(strikes)]
-    if df.empty:
-        raise RuntimeError(f"No option instruments for strikes {strikes} on expiry {expiry_iso}.")
-    out = df[["tradingsymbol", "instrument_token", "strike", "instrument_type", "expiry"]].copy()
-    out = out.sort_values(["strike", "instrument_type"], ascending=[True, True])
-    return out
-
-def init_db():
-    con = duckdb.connect(DB_PATH)
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS oi_snapshots (
-            ts TIMESTAMP,
-            trade_date DATE,
-            fut_symbol VARCHAR,
-            fut_ltp DOUBLE,
-            opt_expiry DATE,
-            strike INTEGER,
-            opt_right VARCHAR,
-            tradingsymbol VARCHAR,
-            instrument_token BIGINT,
-            oi BIGINT,
-            ltp DOUBLE
-        )
-    """)
-    cols = {row[1] for row in con.execute("PRAGMA table_info('oi_snapshots')").fetchall()}
-    if "volume" not in cols:
-        con.execute("ALTER TABLE oi_snapshots ADD COLUMN volume BIGINT")
-    con.close()
-
-def insert_snapshot(rows: pd.DataFrame):
-    con = duckdb.connect(DB_PATH)
-    con.register("df_rows", rows)
-    con.execute("INSERT INTO oi_snapshots SELECT * FROM df_rows")
-    con.close()
-
-def load_day(trade_date_iso: str, opt_expiry_iso: str) -> pd.DataFrame:
-    con = duckdb.connect(DB_PATH)
-    q = """
-        SELECT *
-        FROM oi_snapshots
-        WHERE trade_date = ? AND opt_expiry = ?
-        ORDER BY ts ASC
-    """
-    df = con.execute(q, [trade_date_iso, opt_expiry_iso]).fetchdf()
-    con.close()
-    return df
-
-def load_yday_close(trade_date_iso: str, opt_expiry_iso: str) -> pd.DataFrame:
-    """
-    Yesterday close baseline: take the last snapshot after 15:25 if available,
-    else take the last snapshot of yesterday.
-    """
-    yday = (pd.to_datetime(trade_date_iso).date() - timedelta(days=1)).isoformat()
-    con = duckdb.connect(DB_PATH)
-    q = """
-        SELECT *
-        FROM oi_snapshots
-        WHERE trade_date = ? AND opt_expiry = ?
-        ORDER BY ts ASC
-    """
-    df = con.execute(q, [yday, opt_expiry_iso]).fetchdf()
-    con.close()
-    if df.empty:
-        return df
-
-    df = df.sort_values("ts")
-    # Prefer last snapshot after 15:25
-    cutoff = datetime.combine(pd.to_datetime(yday).date(), dtime(15, 25))
-    after = df[df["ts"] >= cutoff]
-    if not after.empty:
-        last = after.groupby("tradingsymbol").tail(1)
-    else:
-        last = df.groupby("tradingsymbol").tail(1)
-
-    return last[["tradingsymbol", "oi"]].rename(columns={"oi": "oi_yday_close"})
-
-def compute_deltas(hist: pd.DataFrame) -> pd.DataFrame:
-    if hist.empty:
-        return hist
-    hist = hist.sort_values(["tradingsymbol", "ts"]).copy()
-    hist["oi_prev_1"] = hist.groupby("tradingsymbol")["oi"].shift(1)
-    hist["oi_prev_5"] = hist.groupby("tradingsymbol")["oi"].shift(5)
-    hist["d_oi_1m"] = hist["oi"] - hist["oi_prev_1"]
-    hist["d_oi_5m"] = hist["oi"] - hist["oi_prev_5"]
-    hist["ltp_prev_1"] = hist.groupby("tradingsymbol")["ltp"].shift(1)
-    hist["ltp_prev_5"] = hist.groupby("tradingsymbol")["ltp"].shift(5)
-    hist["d_ltp_1m"] = hist["ltp"] - hist["ltp_prev_1"]
-    hist["d_ltp_5m"] = hist["ltp"] - hist["ltp_prev_5"]
-    return hist
 
 def should_insert_snapshot(now_ts: datetime) -> bool:
     minute_key = now_ts.strftime("%Y-%m-%d %H:%M")
@@ -372,65 +75,6 @@ def should_insert_snapshot(now_ts: datetime) -> bool:
         return False
     st.session_state["last_insert_minute_key"] = minute_key
     return True
-
-def load_latest_snapshot(trade_date_iso: str, opt_expiry_iso: str) -> pd.DataFrame:
-    con = duckdb.connect(DB_PATH)
-    q = """
-        SELECT *
-        FROM oi_snapshots
-        WHERE trade_date = ? AND opt_expiry = ?
-        QUALIFY ROW_NUMBER() OVER (PARTITION BY tradingsymbol ORDER BY ts DESC) = 1
-    """
-    df = con.execute(q, [trade_date_iso, opt_expiry_iso]).fetchdf()
-    con.close()
-    return df
-
-def add_impulse_tags(latest: pd.DataFrame, hist: pd.DataFrame, lookback_minutes: int = 30) -> pd.DataFrame:
-    """
-    Adds an impulse tag if abs(Δ1m) > mean + 3*std over last N minutes for that symbol.
-    """
-    if latest.empty or hist.empty:
-        latest["impulse"] = ""
-        return latest
-
-    cutoff = latest["ts"].max() - timedelta(minutes=lookback_minutes)
-    recent = hist[hist["ts"] >= cutoff].copy()
-
-    stats = recent.groupby("tradingsymbol")["d_oi_1m"].agg(["mean", "std"]).reset_index()
-    merged = latest.merge(stats, on="tradingsymbol", how="left")
-
-    # Handle std=0 / NaN
-    merged["std"] = merged["std"].fillna(0.0)
-    merged["mean"] = merged["mean"].fillna(0.0)
-
-    thr = merged["mean"].abs() + 3.0 * merged["std"]
-    merged["impulse"] = np.where(merged["d_oi_1m"].abs() > thr, "IMPULSE", "")
-    return merged
-
-def delete_outside_session(trade_date_iso: str, opt_expiry_iso: str):
-    con = duckdb.connect(DB_PATH)
-    con.execute("""
-        DELETE FROM oi_snapshots
-        WHERE trade_date = ? AND opt_expiry = ?
-          AND (CAST(ts AS TIME) < ? OR CAST(ts AS TIME) > ?)
-    """, [
-        trade_date_iso,
-        pd.to_datetime(opt_expiry_iso).date(),
-        MARKET_OPEN.strftime("%H:%M:%S"),
-        MARKET_CLOSE.strftime("%H:%M:%S"),
-    ])
-    con.close()
-
-def latest_available_trade_date(opt_expiry_iso: str) -> str | None:
-    con = duckdb.connect(DB_PATH)
-    q = """
-        SELECT MAX(trade_date) AS d
-        FROM oi_snapshots
-        WHERE opt_expiry = ?
-    """
-    d = con.execute(q, [opt_expiry_iso]).fetchone()[0]
-    con.close()
-    return None if d is None else str(d)
 
 # -------------------- UI Controls --------------------
 st.sidebar.header("Controls")
@@ -453,10 +97,10 @@ try:
     if market_live:
         # ---------------- LIVE MODE ----------------
         fut_token, fut_symbol, fut_expiry = pick_nearest_nifty_fut(inst_df)
-        fut_ltp = float(kite.ltp([f"NFO:{fut_symbol}"])[f"NFO:{fut_symbol}"]["last_price"])
+        fut_ltp = float(data_service.ltp([f"NFO:{fut_symbol}"])[f"NFO:{fut_symbol}"]["last_price"])
 
-        spot_symbol = "NSE:NIFTY 50"
-        spot_ltp = float(kite.ltp([spot_symbol])[spot_symbol]["last_price"])
+        spot_symbol = SPOT_SYMBOL
+        spot_ltp = float(data_service.ltp([spot_symbol])[spot_symbol]["last_price"])
         
         # ATM (freeze outside market hours happens naturally because this block runs only when live)
         atm_candidate = round_to_50(spot_ltp)
@@ -490,7 +134,7 @@ try:
 
         # Fetch quotes (OI + LTP) + insert snapshot once/min
         symbols = [f"NFO:{s}" for s in opt_df["tradingsymbol"].tolist()]
-        quotes = kite.quote(symbols)
+        quotes = data_service.quote(symbols)
         now_ts_naive = now_ts.replace(tzinfo=None)
         
         snap_rows = []
@@ -542,7 +186,7 @@ try:
         # Use DB values (do NOT fetch live)
         fut_symbol = str(latest_snap["fut_symbol"].iloc[0])
         fut_ltp = float(latest_snap["fut_ltp"].iloc[0])
-        spot_symbol = "NSE:NIFTY 50"
+        spot_symbol = SPOT_SYMBOL
         spot_ltp = fut_ltp
 
         strikes = sorted(latest_snap["strike"].unique().tolist())

@@ -1,0 +1,2 @@
+"""NIFTY OI application package."""
+
